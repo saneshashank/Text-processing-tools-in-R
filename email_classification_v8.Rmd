@@ -1,0 +1,2332 @@
+---
+title: "BPO email classification"
+author: "Sayan Banerjee"
+date: "January 22, 2018"
+output: 
+  html_document: 
+    number_sections: yes
+    toc: yes
+---
+# Synopsis
+
+save.image("D:/Data Science/BPO/email_classification/scripts/bpo_email_classify.RData")  
+load("D:/Data Science/BPO/email_classification/scripts/bpo_email_classify.RData") 
+
+Loading the required packages for the data analysis  
+
+```{r loadpackages, echo=TRUE, results="hide", message=FALSE,warning=FALSE}
+
+library(ggplot2)
+
+library(tm)
+library(slam)
+library(RWeka)
+library(wordcloud)
+library(openNLP)
+
+library(plyr)
+library(dplyr)
+library(reshape2)
+library(lazyeval)
+library(tidyr)
+library(stringi)
+library(stringr)
+library(corrplot)
+
+library(caret)
+library(pROC) # for AUC calculations
+
+
+library(knitr)
+library(xtable)
+
+```
+
+
+
+```{r setopions, echo=FALSE}
+opts_chunk$set(echo=TRUE, results="asis",cache=TRUE,tidy=FALSE,warning=FALSE)
+opts_chunk$set(out.width='750px', dpi=200)
+```
+
+
+# User defined function
+
+All user defined functions are currently hidden  
+
+```{r define_functions, echo=FALSE,cache=FALSE}
+
+trim <- function (x) gsub("^\\s+|\\s+$", "", x)
+
+strtable <- function(df, n=4, width=60, 
+                     n.levels=n, width.levels=width, 
+                     factor.values=as.character) {
+  stopifnot(is.data.frame(df))
+  tab <- data.frame(variable=names(df),
+                    class=rep(as.character(NA), ncol(df)),
+                    levels=rep(as.character(NA), ncol(df)),
+                    examples=rep(as.character(NA), ncol(df)),
+                    stringsAsFactors=FALSE)
+  collapse.values <- function(col, n, width) {
+    result <- NA
+    for(j in 1:min(n, length(col))) {
+      el <- ifelse(is.numeric(col),
+                   paste0(col[1:j], collapse=', '),
+                   paste0('"', col[1:j], '"', collapse=', '))
+      if(nchar(el) <= width) {
+        result <- el
+      } else {
+        break
+      }
+    }
+    if(length(col) > n) {
+      return(paste0(result, ', ...'))
+    } else {
+      return(result)
+    }
+  }
+  
+  for(i in seq_along(df)) {
+    if(is.factor(df[,i])) {
+      tab[i,]$class <- paste0('Factor w/ ', nlevels(df[,i]), ' levels')
+      tab[i,]$levels <- collapse.values(levels(df[,i]), n=n.levels, width=width.levels)
+      tab[i,]$examples <- collapse.values(factor.values(df[,i]), n=n, width=width)
+    } else {
+      tab[i,]$class <- class(df[,i])[1]
+      tab[i,]$examples <- collapse.values(df[,i], n=n, width=width)
+    }
+    
+  }
+  
+  class(tab) <- c('strtable', 'data.frame')
+  return(tab)
+}
+
+#' Prints the results of \code{\link{strtable}}.
+#' @param x result of code \code{\link{strtable}}.
+#' @param ... other parameters passed to \code{\link{print.data.frame}}.
+#' @export
+print.strtable <- function(x, ...) {
+  NextMethod(x, row.names=FALSE, ...)
+}
+
+tagPOS <-  function(x, ...) {
+  s <- as.String(x)
+  if(length(s) > 0 & nchar(s) > 1)
+  {
+    word_token_annotator <- Maxent_Word_Token_Annotator()
+    a2 <- Annotation(1L, "sentence", 1L, nchar(s))
+    a2 <- annotate(s, word_token_annotator, a2)
+    a3 <- NLP::annotate(s, Maxent_POS_Tag_Annotator(), a2)
+    a3w <- a3[a3$type == "word"]
+    POStags <- unlist(lapply(a3w$features, `[[`, "POS"))
+    POStagged <- paste(sprintf("%s/%s", s[a3w], POStags), collapse = " ")
+    pos_ret <- list(POStagged = POStagged, POStags = POStags)
+  } else {
+    pos_ret <- list(POStagged = s, POStags = "")
+  }
+  pos_ret
+    
+}
+annotators <- list(sent_token = Maxent_Sent_Token_Annotator(),
+                   word_token = Maxent_Word_Token_Annotator(),
+                   pos_tag    = Maxent_POS_Tag_Annotator())
+extractPOS <- function(x, POSregex_list, 
+                       POSregex_exclude_list = "",
+                       with_tag = FALSE,
+                       ann = annotators) {
+  #print(paste("extractPOS started: ",Sys.time()))
+  x <- as.String(x)
+  #print(x)
+  if(length(x) > 0 & nchar(x) > 1)
+  {
+      wordAnnotation <- NLP::annotate(x, list(ann$sent_token, ann$word_token))
+      #print(paste("Maxent_Sent_Token_Annotator and Maxent_Word_Token_Annotator completed: ",
+      #Sys.time()))
+      POSAnnotation <- annotate(x, ann$pos_tag, wordAnnotation)
+      #print(paste("Maxent_POS_Tag_Annotator completed: ",Sys.time()))
+      POSwords <- subset(POSAnnotation, type == "word")
+      tags <- sapply(POSwords$features, '[[', "POS")
+      if(length(POSregex_list) > 0 & nchar(POSregex_list[1]) > 1)
+      {
+        thisPOSindex <- grep(paste(POSregex_list,collapse="|"), tags)
+        if (length(thisPOSindex) > 0)
+        {
+          if(length(POSregex_exclude_list) > 0 & 
+             nchar(POSregex_exclude_list[1]) > 1)
+          {
+            thisPOSindex <- setdiff(thisPOSindex, 
+            grep(paste(POSregex_exclude_list,collapse="|"), tags))
+          }
+          if(with_tag)
+          {
+            tokenizedAndTagged <- sprintf("%s/%s", 
+                                          x[POSwords][thisPOSindex],
+                                          tags[thisPOSindex])
+          } else tokenizedAndTagged <- as.character(x[POSwords])[thisPOSindex]
+        } else tokenizedAndTagged <- ""
+    
+      } else {
+        tokenizedAndTagged <- sprintf("%s/%s", x[POSwords], tags)
+      }
+      untokenizedAndTagged <- paste(tokenizedAndTagged, collapse = " ")
+  } else {
+    untokenizedAndTagged <- x
+  }
+  
+  untokenizedAndTagged
+}
+
+dtm.generate <- function(df,ng,
+                         sparse=1,
+                         spl_sym = "",
+                         my_stop_word_file="",
+                         keep.id=FALSE,
+                         remove_non_english_char = TRUE,
+                         removeNum = TRUE,
+                         removePunc = TRUE,
+                         removeStpWords = TRUE,
+                         doStem = TRUE,
+                         doIDF = TRUE,
+                         doNormTf = TRUE)
+{
+  
+  if (remove_non_english_char)
+  {
+    for(c in 1:ncol(df))
+    {
+    
+      df[,colnames(df)[c]] <- gsub("[^\x20-\x7E]", "",
+                                             df[,colnames(df)[c]])
+    }
+  }
+  if(keep.id == TRUE)
+  {
+    # tutorial on rweka - http://tm.r-forge.r-project.org/faq.html
+     m <- list(id = "ID", content = colnames(df)[2])
+     myReader <- readTabular(mapping = m)
+
+     corpus <- VCorpus(DataframeSource(df), readerControl = list(reader = myReader))
+   
+    # Manually keep ID information from http://stackoverflow.com/a/14852502/1036500
+#       for (i in 1:length(corpus)) {
+#         attr(corpus[[i]], "id") <- df$ID[i]
+#         #corpus[[i]]$meta$ID <- df$ID[i]
+#       }
+  } else
+  {
+    corpus <- Corpus(VectorSource(df[,1])) # create corpus for TM processing
+  }
+  
+  corpus <- tm_map(corpus, content_transformer(tolower))
+  corpus <- tm_map(corpus, stripWhitespace)
+  if (removeNum) corpus <- tm_map(corpus, removeNumbers) 
+  if(length(spl_sym) > 0 & sum(nchar(spl_sym)) > 0)
+  {
+    corpus <- tm_map(corpus, content_transformer(gsub), 
+                     pattern = paste(spl_sym,collapse="|"), replacement = " ")
+  }
+  if (removePunc) corpus <- tm_map(corpus, removePunctuation)
+  if (doStem) corpus <- tm_map(corpus, stemDocument)
+  if (removeStpWords) corpus <- tm_map(corpus, removeWords, 
+                                       c(stopwords("SMART"),stopwords("english")))
+  if(my_stop_word_file !="")
+  {
+    content_specific_stop_words <- read.csv(my_stop_word_file,
+                                            header=F,stringsAsFactors = F)
+    corpus <- tm_map(corpus, removeWords, content_specific_stop_words[,1])
+  }
+  #corpus <- tm_map(corpus, PlainTextDocument)
+  if (ng >1)
+  {
+    options(mc.cores=1) # http://stackoverflow.com/questions/17703553/bigrams-instead-of-single-words-in-termdocument-matrix-using-r-and-rweka/20251039#20251039
+    # this stopped working in new server environment
+    #BigramTokenizer <- function(x) NGramTokenizer(x, Weka_control(min = ng, max = ng)) # create n-grams
+    nGramTokenizer <-
+      function(x)
+        unlist(lapply(ngrams(words(x), ng), paste, collapse = " "), use.names = FALSE)
+    if(doIDF)
+    {
+        dtm <- DocumentTermMatrix(corpus, control = list(tokenize = nGramTokenizer,
+                                                   weighting = function(x)                                                          
+                                                          weightTfIdf(x, normalize = doNormTf))) # create tdm from n-grams
+    } else
+    {
+          dtm <- DocumentTermMatrix(corpus, control = list(tokenize = nGramTokenizer,
+                                                   weighting = weightTf)) # create tdm from n-grams
+    }
+    
+  }
+  else
+  {
+    if(doIDF)
+    {
+        dtm <- DocumentTermMatrix(corpus,control = list(weighting = function(x)                                                          
+                                                            weightTfIdf(x, normalize = doNormTf)))
+    } else
+    {
+      dtm <- DocumentTermMatrix(corpus,control = list(weighting = weightTf))
+    }
+    
+  }
+  if(sparse != 1)
+  {
+    dtms <- removeSparseTerms(dtm, sparse)
+  }
+  else
+  {
+    dtms <- dtm
+  }
+
+  dtms
+}
+
+wf.generate <- function(dtm,
+                        wc_freq,
+                        wc_freq_scale)
+{
+  
+  freq <- sort(colSums(as.matrix(dtm)), decreasing=TRUE) 
+  wf <- data.frame(word=names(freq), freq=freq,stringsAsFactors = FALSE)   
+  
+
+  
+  par(mfrow = c(1, 1))
+  set.seed(142)   
+  wordcloud(names(freq), freq, min.freq=2,max.words=wc_freq, 
+            rot.per=0.15, scale=wc_freq_scale, 
+            random.order=FALSE,
+            colors=brewer.pal(6, "Dark2")) 
+
+  wf
+}
+
+remove.unclustered.dtm <- function(dtm)
+{
+  rowTotals <- apply(dtm , 1, sum) #Find the sum of words in each Document
+  dtm.non_uncl <- dtm[rowTotals> 0,] 
+  dtm.non_uncl
+}
+
+get.match.score <- function(all_string,words)
+{
+  score <- sum((str_count(all_string, words)) * 
+                 (str_count(words,'\\w+') ^ str_count(words,'\\w+')))
+  score
+}
+
+suggest_stop_words <- function(df,ng = 1:3,sparse=1,
+                               my_stop_word_file = "",special_symbols = "")
+{
+  all_suggested_stop_words <- c()
+  for (i in 1:length(ng))
+  {
+    content_DTM_4_stopwords <- dtm.generate(df,
+                                ng[i],sparse,
+                                keep.id=TRUE,
+                                doIDF = TRUE,
+                                doNormTf = TRUE,
+                                spl_sym = special_symbols,
+                                my_stop_word_file = my_stop_word_file)
+    freq <- sort(colSums(as.matrix(content_DTM_4_stopwords)), decreasing=TRUE) 
+    wf_4_stop_words <- data.frame(word=names(freq), freq=freq,stringsAsFactors = FALSE)
+  
+    
+    #hist(log2(wf_4_stop_words$freq),breaks = 50)
+    
+    wf_4_stop_words$log_freq <- log2(wf_4_stop_words$freq)
+    
+    log_freq_iqr <- IQR(wf_4_stop_words$log_freq)
+    log_freq_1stq <- as.numeric(quantile(wf_4_stop_words$log_freq,na.rm=T)[2])
+    log_freq_med <- as.numeric(quantile(wf_4_stop_words$log_freq,na.rm=T)[3])
+    log_freq_3rdq <- as.numeric(quantile(wf_4_stop_words$log_freq,na.rm=T)[4])
+    
+    suggested_stop_words <- wf_4_stop_words %>%
+      filter(wf_4_stop_words$log_freq > log_freq_3rdq + 1.5 * log_freq_iqr |
+      (wf_4_stop_words$log_freq >= log_freq_1stq - 1.5 * log_freq_iqr & 
+         wf_4_stop_words$log_freq <= log_freq_med)) %>%
+      select(word)
+    
+    all_suggested_stop_words <- c(all_suggested_stop_words,suggested_stop_words[,1])
+  }
+  suggested_stop_words_all <- as.data.frame(all_suggested_stop_words)
+  names(suggested_stop_words_all) <- "word"
+  suggested_stop_words_all$word <- as.character(suggested_stop_words_all$word)
+  
+  score <- c()
+  for (i in 1:nrow(suggested_stop_words_all))
+  { 
+    score <- c(score,
+               get.match.score(suggested_stop_words_all[-i,1],
+                               suggested_stop_words_all[i,1]))
+  }
+  suggested_stop_words_all <- cbind(suggested_stop_words_all,score)
+  suggested_stop_words_all <- suggested_stop_words_all[order(suggested_stop_words_all$score,
+                                                             decreasing=TRUE),]
+  recom_stop_words <- suggested_stop_words_all %>%
+    filter(score > 0)
+  
+  return(recom_stop_words)
+}
+
+create_group_plots <- function(df,target,var_list,top_num = c(5,3))
+{
+  
+  top_items <- as.data.frame(df %>%
+            group_by_(.dots = var_list) %>%
+            summarise(n = n()))
+
+  top_items <- top_items[order(top_items$n,decreasing = T),][1:top_num[1],]
+  
+  reduced_dataset <- df
+  for (i in 1:length(var_list))
+  {
+    reduced_dataset <- reduced_dataset[which(reduced_dataset[,var_list[i]] %in%
+                                  top_items[,var_list[i]]),]
+    #print(nrow(reduced_dataset))
+  }
+
+  hist(reduced_dataset[,target],
+       breaks = 25,
+       main=paste("Histogram for",target,"for top",top_num[1],var_list[i],sep =" "), 
+        xlab=target)
+  
+  #reduced_dataset$req_year_mon <- as.yearmon(reduced_dataset[,date_field])
+  
+  if(length(var_list) == 1)
+  {
+
+    barDF_mean <- as.data.frame(df %>%
+     filter_(paste("!is.na(",target,")")) %>%
+     group_by_(.dots = c(var_list)) %>%
+            summarise_(average = interp(~mean(var, na.rm = TRUE),
+                                    var = as.name(target))))
+    barDF_mean_dec <- barDF_mean[order(barDF_mean$average, decreasing = TRUE),]
+    bar_plot_mean_dec <- ggplot(barDF_mean_dec[1:top_num[1],], 
+                                aes_string(x = paste0("reorder(",
+                                                as.name(colnames(barDF_mean_dec)[1]),
+                                              ", -",as.name(colnames(barDF_mean_dec)[2]), 
+                                                    ")"),
+                                y = as.name(colnames(barDF_mean_dec)[2]))) +
+              geom_bar(stat='identity') +
+                theme(axis.text.x = element_text(angle = 90,hjust = 1)) +
+        xlab(var_list[1]) +
+        ylab(paste("Average ",target,sep=" ")) +
+      scale_x_discrete(labels = function(x) str_wrap(x, width = 30)) +
+     ggtitle(paste("Variation of average postitive",target,"for",var_list[1],sep=" "))
+  
+    print(bar_plot_mean_dec)
+    
+    barDF_mean_inc <- barDF_mean[order(barDF_mean$average, decreasing = FALSE),]
+    bar_plot_mean_inc <- ggplot(barDF_mean_inc[1:top_num[1],], 
+                                aes_string(x = paste0("reorder(",
+                                                as.name(colnames(barDF_mean_inc)[1]),
+                                              ", ",as.name(colnames(barDF_mean_inc)[2]), 
+                                                    ")"),
+                                y = as.name(colnames(barDF_mean_inc)[2]))) +
+              geom_bar(stat='identity') +
+                theme(axis.text.x = element_text(angle = 90,hjust = 1)) +
+        xlab(var_list[1]) +
+        ylab(paste("Average ",target,sep=" ")) +
+      scale_x_discrete(labels = function(x) str_wrap(x, width = 30)) +
+     ggtitle(paste("Variation of average negative",target,"for",var_list[1],sep=" "))
+  
+    print(bar_plot_mean_inc)
+    
+    barDF_max <- as.data.frame(df %>%
+     filter_(paste("!is.na(",target,")")) %>%
+     group_by_(.dots = c(var_list)) %>%
+            summarise_(max_sent = interp(~max(var, na.rm = TRUE),
+                                    var = as.name(target))))
+    barDF_max <- barDF_max[order(barDF_max$max_sent, decreasing = TRUE),]
+    bar_plot_max <- ggplot(barDF_max[1:top_num[1],], aes_string(x = paste0("reorder(",
+                                                    as.name(colnames(barDF_max)[1]),
+                                                  ", -",as.name(colnames(barDF_max)[2]), 
+                                                    ")"),
+                                y = as.name(colnames(barDF_max)[2]))) +
+              geom_bar(stat='identity') +
+                theme(axis.text.x = element_text(angle = 90,hjust = 1)) +
+        xlab(var_list[1]) +
+        ylab(paste("Most positive",target,sep=" ")) +
+      scale_x_discrete(labels = function(x) str_wrap(x, width = 30)) +
+     ggtitle(paste("Variation of most postitive",target,"for",var_list[1],sep=" "))
+  
+    print(bar_plot_max)
+    
+    barDF_min <- as.data.frame(df %>%
+     filter_(paste("!is.na(",target,")")) %>%
+     group_by_(.dots = c(var_list)) %>%
+            summarise_(min_sent = interp(~min(var, na.rm = TRUE),
+                                    var = as.name(target))))
+    barDF_min <- barDF_min[order(barDF_min$min_sent, decreasing = FALSE),]
+    bar_plot_min <- ggplot(barDF_min[1:top_num[1],], aes_string(x = paste0("reorder(",
+                                                    as.name(colnames(barDF_min)[1]),
+                                                  ",",as.name(colnames(barDF_min)[2]), 
+                                                    ")"),
+                                y = as.name(colnames(barDF_min)[2]))) +
+              geom_bar(stat='identity') +
+                theme(axis.text.x = element_text(angle = 90,hjust = 1)) +
+        xlab(var_list[1]) +
+        ylab(paste("Most negative",target,sep=" ")) +
+      scale_x_discrete(labels = function(x) str_wrap(x, width = 30)) +
+     ggtitle(paste("Variation of most negative",target,"for",var_list[1],sep=" "))
+  
+    print(bar_plot_min)
+    
+    group_box <- ggplot(aes_(y = as.name(target), x = as.name(var_list[1])), 
+         data = reduced_dataset) + geom_boxplot()+
+          theme(axis.text.x = element_text(angle = 90,hjust = 1))+
+      scale_x_discrete(labels = function(x) str_wrap(x, width = 30)) +
+     ggtitle(paste("Variation of ",target,"for top",
+                   top_num[1],var_list[1],sep=" "))
+    
+  } else {
+    
+    top_items2 <- as.data.frame(reduced_dataset %>%
+      group_by_(var_list[2]) %>%
+      summarise(n=n()))
+    
+    top_items2 <- top_items2[order(top_items2$n,decreasing = T),][1:top_num[2],]
+    reduced_dataset2 <- reduced_dataset[which(reduced_dataset[,var_list[2]] %in%
+                                  top_items2[,var_list[2]]),]
+    
+    
+    group_box <- ggplot(aes_(y = as.name(target), 
+                x = as.name(var_list[1]), 
+                fill = as.name(var_list[2])), 
+           data = reduced_dataset2) + geom_boxplot()+
+      theme(axis.text.x = element_text(angle = 90,hjust = 1))+
+      scale_x_discrete(labels = function(x) str_wrap(x, width = 30)) +
+     ggtitle(paste("Variation of",target,"for top",top_num[1],var_list[1],
+                   "\nand top",top_num[2],var_list[2],"combination",sep=" "))
+    
+
+  }
+  
+  print(group_box)
+
+}
+
+wordcloud_by_group <- function(visDF,groupbycol,id_and_text_cols,
+                               ngrams=1,sparse=0.999,special_symbols="",
+                               stop_words_file ="")
+{
+  for(ngram in ngrams)
+  {
+    
+    for(val in unique(visDF[[groupbycol]]))
+    {
+      tempDF <- visDF %>%
+        filter_(interp(~var == val, var = as.name(groupbycol))) %>%     
+        select(one_of(id_and_text_cols))
+      names(tempDF) <- c("ID","content")
+      content_DTM <- dtm.generate(tempDF,
+                                ngram,sparse,
+                                spl_sym = special_symbols,
+                                my_stop_word_file = stop_words_file,
+                                keep.id=TRUE,
+                                doIDF = FALSE)
+
+
+
+      term_tfidf <- tapply(content_DTM$v/slam::row_sums(content_DTM)[content_DTM$i],
+                       content_DTM$j, mean) *
+                log2(tm::nDocs(content_DTM)/slam::col_sums(content_DTM > 0))
+
+
+
+      term_tfidf_iqr <- summary(term_tfidf)[5] - summary(term_tfidf)[2]
+
+      content_DTM.reduced <- content_DTM[,
+                                         term_tfidf < (summary(term_tfidf)[5]
+                                                         + 1.5 *  term_tfidf_iqr) &
+                            term_tfidf > (summary(term_tfidf)[2]
+                                            - 1.5 * term_tfidf_iqr)]
+      cat("  \n")
+      cat(paste("  Word cloud for",ngram," gram and group",
+                  groupbycol,"==",val,"  \n"))
+      wf_content_DTM <- wf.generate(dtm=content_DTM.reduced,
+                                   wc_freq = 50,
+                                   wc_freq_scale = c(3, .3))
+      
+    }
+  }
+  
+}
+
+run_stat_test <- function(training, target_col, verbos = F)
+{
+    stats_test_df <- data.frame()
+    for (i in 1:ncol(training))
+    {
+    
+      if(is.factor(training[,i]) &
+         length(levels(training[,i])) > 1 &
+         colnames(training)[i] != target_col)
+      {
+        if (verbos) print(paste("Chi-square test between",
+                              colnames(training)[i],"and",target_col))
+        chisq_test_val <- chisq.test(training[,target_col],
+                                             training[,i],
+                                             correct=FALSE)
+        tempDF <- as.matrix(t(c(target_col,
+                                  colnames(training)[i],
+                                  "Chi-square",
+                                  chisq_test_val[['statistic']],
+                                  chisq_test_val[['p.value']])))
+        colnames(tempDF) <- c("Dependent_Variable",
+                           "Independent_Variable",
+                           "test",
+                           "X_squared",
+                           "p_value")
+    
+        stats_test_df <- rbind.data.frame(stats_test_df,tempDF,stringsAsFactors = FALSE)
+    
+      } else if((is.numeric(training[,i])|is.integer(training[,i])) &
+                colnames(training)[i] != target_col & length(unique(training[,i])) > 1)
+      {
+        for(k in 1:(length(levels(training[,target_col]))-1))
+        {
+          for (j in (k+1):length(levels(training[,target_col])))
+          {
+    
+            t_test_df <- training[training[,target_col] == levels(training[,target_col])[k] |
+                      training[,target_col] ==levels(training[,target_col])[j],]
+            #t_test_df <- droplevels(t_test_df) 
+            t_test_df[,target_col] <- factor(t_test_df[,target_col])
+            if (verbos) print(paste("t-test between",
+                              colnames(training)[i],"and",target_col))
+            formula <- paste(colnames(training)[i], "~",target_col)
+            if (verbos) print(paste(levels(training[,target_col])[k],"~",
+                                    levels(training[,target_col])[j]))
+            
+            if(length(levels(t_test_df[,target_col])) > 1)
+            {
+              if (verbos) print("More than 1 level exists")
+              t_test_val <- t.test(as.formula(formula),t_test_df)
+    
+              tempDF <- as.matrix(t(c(paste(target_col,":",
+                                          levels(training[,target_col])[k],"-",
+                                          levels(training[,target_col])[j]),
+                                  colnames(training)[i],
+                                  "t-test",
+                                  ifelse(is.finite(t_test_val$statistic),
+                                         t_test_val$statistic,0),
+                                  ifelse(is.finite(t_test_val$p.value),
+                                         t_test_val$p.value,1))))
+            }
+            else
+            {
+                tempDF <- as.matrix(t(c(paste(target_col,":",
+                                            levels(training[,target_col])[k],"-",
+                                            levels(training[,target_col])[j]),
+                                    colnames(training)[i],
+                                    "t-test",
+                                    "0",
+                                    "0")))
+            }
+            
+            colnames(tempDF) <- c("Dependent_Variable",
+                               "Independent_Variable",
+                               "test",
+                               "X_squared",
+                               "p_value")
+            stats_test_df <- rbind.data.frame(stats_test_df,tempDF,
+                                              stringsAsFactors = FALSE)
+          }
+    
+        }
+      }
+    }
+    if (verbos) print("All tests complete")
+    
+    stats_test_df$X_squared <- as.numeric(stats_test_df$X_squared)
+    stats_test_df$p_value <- as.numeric(stats_test_df$p_value)
+    
+    stats_test_df <- stats_test_df[order(stats_test_df$Independent_Variable,
+                                         stats_test_df$p_value),]
+    
+    return(stats_test_df)
+}
+
+
+get_all_metrics <- function(cf)
+{
+  cfDF <- as.data.frame.matrix(cf$table)
+  cf_rownames <- rownames(cfDF)
+  cfDF <- cfDF %>%
+    mutate(class_total_ref = colSums(.)) %>%
+    mutate(class_total_pred = rowSums(.[1:(ncol(.)-1)]))
+  
+  rownames(cfDF) <- cf_rownames
+  
+  accuracy_matrix <- data.frame(cf$byClass)
+  
+  cfDF <- cbind.data.frame(cfDF,accuracy_matrix)
+  cfDF <- cfDF[order(cfDF$class_total_ref,decreasing=TRUE),]
+  cfDF <- cbind.data.frame(cfDF,
+                           Overall_Accuracy=round(cf$overall[1],2),
+                           Overall_Kappa = round(cf$overall[2],2))
+  return(cfDF)
+}
+
+```
+
+
+# Read input data
+
+```{r read_data}
+
+raw_data_df <- read.csv("D:/Data Science/BPO/email_classification/input/Email_Dump_OEM_and_Spares.csv",
+                      stringsAsFactors = F)
+
+print(xtable(strtable(raw_data_df)),
+      type="html",include.rownames = FALSE)
+
+
+```
+
+## Select only first record
+
+```{r select first records}
+top_category_list <- c("Shipment Status",
+                       "For your information cases",
+                       "Expedite request",
+                       "Internal Team Request to order status team",
+                       "Quote status"
+                       )
+id_column <- "Case.Number"
+text_column <- c("Subject","Description")
+target_column <- "Category"
+date_column <- "Message.Date"
+
+
+client_name <- c("honeywell","MyAerospace")
+PO_regexp <- "[A-Z0-9]+[A-Z]+[0-9]+"
+
+
+email_regexp <- "[[:alnum:]._-]+@[[:alnum:].-]+"
+phone_regexp <- "\\s*(?:\\+?(\\d{1,3}))?[-. (]*(\\d{1,3})[-. )]*(\\d{3,4})[-. ]*(\\d{3,4})(?: *x(\\d+))?\\s*"
+  #"(\\+\\d{1,2}\\s)?\\(?\\d{3}\\)?[\\s.-]?\\d{3}[\\s.-]?\\d{4}"
+  
+email_split_tokens <- c("From:",
+                        "De:")
+
+email_body_split_tokens <- c("Thanks",
+                             "Thanks so much",
+                             "Thanks again",
+                             "Thank you",
+                             "Thanks you",
+                             "Kind regards",
+                             "Best regards",
+                             "Regards",
+                             "Cordialement",
+                             "Mit freundlichen Gruben",
+                             "Thanks and Regards",
+                             "Many thanks in advance",
+                             "Thanks a lot",
+                             "Thanks for the support",
+                             "Thanks in advance",
+                             "Saludos")
+
+email_body_split_regex <- ""
+for (i in 1:length(email_body_split_tokens))
+{
+  email_body_split_regex <- paste0(email_body_split_regex,
+                                email_body_split_tokens[i],
+                                "[[:punct:]+]|",
+                                email_body_split_tokens[i],
+                                "\n",
+                                "|")
+}
+
+final_email_split_regex <- paste0(email_body_split_regex,
+                                  paste0(email_split_tokens,collapse = "|"))
+
+
+raw_data_df[,date_column] <- as.POSIXct(raw_data_df[,date_column],format="%m/%d/%Y %H:%M")
+
+raw_data_df[,target_column] <- trim(raw_data_df[,target_column])
+
+raw_data_df_red <- raw_data_df %>%
+              filter_(paste(target_column, "%in%  top_category_list")) %>%
+              select(one_of(id_column,target_column,date_column,text_column)) %>%
+              filter_(paste("!is.na(",date_column,")"))
+
+print(unique(raw_data_df_red$Category))
+
+raw_data_df_red <- raw_data_df_red[order(raw_data_df_red[,id_column],
+                                         raw_data_df_red[,date_column]),]
+
+data_df_final <- raw_data_df_red[!duplicated(raw_data_df_red[,id_column]),]
+
+for (i in 1:length(text_column))
+{
+	data_df_final[,text_column[i]] <- gsub(email_regexp, " some_email@address.domain ",
+                                       ignore.case = T,
+         data_df_final[,text_column[i]])
+	data_df_final[,text_column[i]] <- gsub(phone_regexp, " XXXXXXXXXX ",
+                                data_df_final[,text_column[i]])
+
+	data_df_final[,text_column[i]] <- gsub(paste(client_name,collapse="|"), " client_name ",
+                                       ignore.case = T,
+                                       data_df_final[,text_column[i]])
+
+	data_df_final[,text_column[i]] <- gsub(PO_regexp, " PO_NO ",
+                                       data_df_final[,text_column[i]])
+									   
+	email_split <- str_split(data_df_final[,text_column[i]],
+                                  regex(final_email_split_regex,
+                                        ignore_case = TRUE))
+
+	data_df_final[,text_column[i]] <- unlist(lapply(email_split, `[[`, 1))
+
+	data_df_final[,text_column[i]] <- trim(data_df_final[,text_column[i]])
+}
+
+
+data_df <- data_df_final %>%
+            select(one_of(id_column,target_column,text_column))
+
+print(xtable(strtable(data_df)),
+      type="html",include.rownames = FALSE)
+
+```
+
+## Data fields formatting
+
+```{r data formatting}
+data_df$is_fyi <- ifelse(data_df$Category == "For your information cases" |
+                        data_df$Category == "Internal Team Request to order status team",
+                         "yes","no")
+
+data_df$is_fyi <- as.factor(data_df$is_fyi)
+data_df$Category <- make.names(data_df$Category)
+data_df$Category <- as.factor(data_df$Category)
+
+for(i in 1:length(text_column))
+{
+  
+  data_df[,text_column[i]] <- gsub("[x]{2,}"," ",
+                                 ignore.case = T,
+                                 data_df[,text_column[i]])
+}
+
+```
+
+# Split in train and test  
+  
+Next block will split the data in 80% for training and 20% testing.  
+  
+```{r email class prediction train and test}
+
+set.seed(32)
+intrainandval <-createDataPartition(y=data_df$Category,p=0.9,list=FALSE)
+trainandval <- data_df[intrainandval,]
+blind_test <- data_df[-intrainandval,]
+
+set.seed(32)
+intrain <-createDataPartition(y=trainandval$Category,p=0.8,list=FALSE)
+training <- trainandval[intrain,]
+testing <- trainandval[-intrain,]
+
+```
+
+# Basic Visualization  
+  
+## Split in category types
+  
+```{r Category bar chart}
+
+categories <- as.data.frame(training %>%
+  group_by(Category) %>%
+  dplyr::summarize(n=n()))
+
+ggplot(categories, aes(x=reorder(Category,n), y = n)) +
+  geom_bar(stat='identity') +
+  coord_flip()
+
+```
+
+
+## Split by derived column is_fyi
+
+```{r is_fyi bar chart}
+
+is_fyi <- as.data.frame(training %>%
+  group_by(is_fyi) %>%
+  dplyr::summarize(n=n()))
+
+ggplot(is_fyi, aes(x=reorder(is_fyi,n), y = n)) +
+  geom_bar(stat='identity') +
+  coord_flip()
+
+```
+
+```{r prep for DTM}
+
+sub_keywordsDF <- cbind.data.frame(training$Case.Number,training[,text_column[1]],
+                                  stringsAsFactors = FALSE)
+desc_keywordsDF <- cbind.data.frame(training$Case.Number,training[,text_column[2]],
+                                  stringsAsFactors = FALSE)
+
+names(sub_keywordsDF) <- c("ID","content")
+names(desc_keywordsDF) <- c("ID","content")
+
+
+```
+
+# Stop words
+```{r set stop words}
+special_symbols <- c("\\/","\\.",":")
+stop_words_file <- "D:/Data Science/BPO/email_classification/input/stop_words_not_masked.csv"
+
+```
+
+  
+```{r stop words suggestion}
+# recommended_stop_words <- suggest_stop_words(data_keywordsDF,1:3,0.999,
+#                                              my_stop_word_file = stop_words_file,
+#                                               special_symbols = special_symbols)
+# 
+# # print(xtable(recommended_stop_words),
+# #       type="html",include.rownames = FALSE)
+# 
+# recom_stop_words_file <- "D:/Data Science/BPO/email_classification/interim/suggested_stop_words_no_pos.csv"
+# 
+# write.csv(recommended_stop_words,recom_stop_words_file,row.names=FALSE)
+# print(paste("  \nFollowing output file created - ",recom_stop_words_file,sep=""))
+
+```
+  
+These are only recommended stop words. Need to use single words stop words from the list  
+  
+
+# Visualizations
+
+## Prepare data for category wise visualization
+
+```{r prep for visual}
+
+sub_visDF <- cbind(sub_keywordsDF,Category = training$Category, is_fyi = training$is_fyi,
+                                  stringsAsFactors = FALSE)
+desc_visDF <- cbind(desc_keywordsDF,Category = training$Category, 
+                    is_fyi = training$is_fyi,
+                                  stringsAsFactors = FALSE)
+
+
+```
+
+## Word cloud by is_fyi value
+
+```{r word cloud for is_fyi}
+
+wordcloud_by_group(sub_visDF,"is_fyi",c("ID","content"),ngrams=1:3,sparse=1,
+                   special_symbols = special_symbols,
+                   stop_words_file = stop_words_file)
+
+wordcloud_by_group(desc_visDF,"is_fyi",c("ID","content"),ngrams=1:3,sparse=1,
+                   special_symbols = special_symbols,
+                   stop_words_file = stop_words_file)
+
+
+```
+
+## Word cloud by Category values
+
+```{r word cloud for categories}
+
+wordcloud_by_group(sub_visDF,"Category",c("ID","content"),ngrams=1:3,sparse=1,
+                   special_symbols = special_symbols,
+                   stop_words_file = stop_words_file)
+
+wordcloud_by_group(desc_visDF,"Category",c("ID","content"),ngrams=1:3,sparse=1,
+                   special_symbols = special_symbols,
+                   stop_words_file = stop_words_file)
+
+
+```
+
+# Feature Creation
+
+## Subject DTM creation
+
+```{r subject dtm_1}
+
+sub_content_DTM_1 <- dtm.generate(sub_keywordsDF,
+                              1,1,
+                              spl_sym = special_symbols,
+                              my_stop_word_file = stop_words_file,
+                              keep.id=TRUE,
+                              doIDF = FALSE)
+
+#summary(slam::col_sums(sub_content_DTM_1))
+
+term1_tfidf <- tapply(sub_content_DTM_1$v/slam::row_sums(
+  sub_content_DTM_1)[sub_content_DTM_1$i], 
+                     sub_content_DTM_1$j, mean) *
+              log2(tm::nDocs(sub_content_DTM_1)/slam::col_sums(sub_content_DTM_1 > 0))
+
+summary(term1_tfidf)
+
+term1_tfidf_iqr <- summary(term1_tfidf)[5] - summary(term1_tfidf)[2]
+
+sub_content_DTM_1.reduced <- sub_content_DTM_1[,
+                                       term1_tfidf < (summary(term1_tfidf)[5] 
+                                                       + 1.5 *  term1_tfidf_iqr) &
+                          term1_tfidf > (summary(term1_tfidf)[2] 
+                                          - 1.5 * term1_tfidf_iqr)]
+
+# sub_content_DTM_1.reduced <- sub_content_DTM_1[,
+#                    term1_tfidf >= (summary(term1_tfidf)[2])]
+
+summary(slam::col_sums(sub_content_DTM_1.reduced))
+
+```
+
+### Word cloud for single word
+
+```{r subject wordclouds_1}
+
+wf_sub_content_DTM_1 <- wf.generate(dtm=sub_content_DTM_1.reduced,
+                                 wc_freq = 50,
+                                 wc_freq_scale = c(3, .3))
+```
+
+```{r subject dtm_2}
+
+sub_content_DTM_2 <- dtm.generate(sub_keywordsDF,
+                              2,1,
+                              spl_sym = special_symbols,
+                              my_stop_word_file = stop_words_file,
+                              keep.id=TRUE,
+                              doIDF = FALSE)
+
+term2_tfidf <- tapply(sub_content_DTM_2$v/slam::row_sums(
+  sub_content_DTM_2)[sub_content_DTM_2$i], 
+                     sub_content_DTM_2$j, mean) *
+              log2(tm::nDocs(sub_content_DTM_2)/slam::col_sums(sub_content_DTM_2 > 0))
+
+summary(term2_tfidf)
+
+term2_tfidf_iqr <- summary(term2_tfidf)[5] - summary(term2_tfidf)[2]
+
+sub_content_DTM_2.reduced <- sub_content_DTM_2[,
+                                       term2_tfidf < (summary(term2_tfidf)[5] 
+                                                       + 1.5 *  term2_tfidf_iqr) &
+                           term2_tfidf >= (summary(term2_tfidf)[2] - 
+                                             1.5 * term2_tfidf_iqr)]
+
+# sub_content_DTM_2.reduced <- sub_content_DTM_2[,
+#                       term2_tfidf >= (summary(term2_tfidf)[2])]
+summary(slam::col_sums(sub_content_DTM_2.reduced))
+#sub_content_DTM_2.reduced$v <- sub_content_DTM_2.reduced$v * (2^2)
+```
+
+### Word cloud for two consequtive words
+
+```{r subject wordclouds_2}
+
+wf_sub_content_DTM_2 <- wf.generate(dtm=sub_content_DTM_2.reduced,
+                                 wc_freq = 50,
+                                 wc_freq_scale = c(2.5, .25))
+
+```
+
+
+```{r subject dtm_3}
+
+sub_content_DTM_3 <- dtm.generate(sub_keywordsDF,
+                              3,1,
+                              spl_sym = special_symbols,
+                              my_stop_word_file = stop_words_file,
+                              keep.id=TRUE,
+                              doIDF = FALSE)
+
+term3_tfidf <- tapply(sub_content_DTM_3$v/slam::row_sums(
+  sub_content_DTM_3)[sub_content_DTM_3$i], 
+                     sub_content_DTM_3$j, mean) *
+              log2(tm::nDocs(sub_content_DTM_3)/slam::col_sums(sub_content_DTM_3 > 0))
+
+summary(term3_tfidf)
+
+term3_tfidf_iqr <- summary(term3_tfidf)[5] - summary(term3_tfidf)[2]
+
+sub_content_DTM_3.reduced <- sub_content_DTM_3[,
+                                       term3_tfidf < (summary(term3_tfidf)[5] 
+                                                       + 1.5 *  term3_tfidf_iqr) &
+                          term3_tfidf >= (summary(term3_tfidf)[2] 
+                                          - 1.5 * term3_tfidf_iqr)]
+
+# sub_content_DTM_3.reduced <- sub_content_DTM_3[,
+#                         term3_tfidf >= (summary(term3_tfidf))[2]] 
+summary(slam::col_sums(sub_content_DTM_3.reduced))
+#sub_content_DTM_3.reduced$v <- sub_content_DTM_3.reduced$v * (3^3)
+
+```
+
+### Word cloud for three consequtive words
+
+```{r subject wordclouds_3}
+
+wf_sub_content_DTM_3 <- wf.generate(dtm=sub_content_DTM_3.reduced,
+                                 wc_freq = 50,
+                                 wc_freq_scale = c(1.5, .15))
+
+```
+
+
+```{r subject dtm_consolidated}
+
+sub_content_DTM <- cbind(sub_content_DTM_3.reduced,
+                         sub_content_DTM_2.reduced,
+                         sub_content_DTM_1.reduced)
+
+
+sub_content_DTM.uncl <- remove.unclustered.dtm(sub_content_DTM)
+
+```
+
+### Word cloud for terms that is used for classification
+
+```{r subject wordclouds_consolidated}
+
+
+wf_sub_content_DTM.uncl <- wf.generate(dtm=sub_content_DTM.uncl,
+                                 wc_freq = 100,
+                                 wc_freq_scale = c(2, .2))
+
+```
+
+
+## Description DTM creation
+
+```{r description dtm_1}
+
+desc_content_DTM_1 <- dtm.generate(desc_keywordsDF,
+                              1,1,
+                              spl_sym = special_symbols,
+                              my_stop_word_file = stop_words_file,
+                              keep.id=TRUE,
+                              doIDF = FALSE)
+
+#summary(slam::col_sums(desc_content_DTM_1))
+
+term1_tfidf <- tapply(desc_content_DTM_1$v/slam::row_sums(
+  desc_content_DTM_1)[desc_content_DTM_1$i], 
+                     desc_content_DTM_1$j, mean) *
+              log2(tm::nDocs(desc_content_DTM_1)/slam::col_sums(desc_content_DTM_1 > 0))
+
+summary(term1_tfidf)
+
+term1_tfidf_iqr <- summary(term1_tfidf)[5] - summary(term1_tfidf)[2]
+
+desc_content_DTM_1.reduced <- desc_content_DTM_1[,
+                                       term1_tfidf < (summary(term1_tfidf)[5] 
+                                                       + 1.5 *  term1_tfidf_iqr) &
+                          term1_tfidf > (summary(term1_tfidf)[2] 
+                                          - 1.5 * term1_tfidf_iqr)]
+
+# desc_content_DTM_1.reduced <- desc_content_DTM_1[,
+#                    term1_tfidf >= (summary(term1_tfidf)[2])]
+
+summary(slam::col_sums(desc_content_DTM_1.reduced))
+
+```
+
+### Word cloud for single word
+
+```{r description wordclouds_1}
+
+wf_desc_content_DTM_1 <- wf.generate(dtm=desc_content_DTM_1.reduced,
+                                 wc_freq = 50,
+                                 wc_freq_scale = c(3, .3))
+```
+
+```{r description dtm_2}
+
+desc_content_DTM_2 <- dtm.generate(desc_keywordsDF,
+                              2,1,
+                              spl_sym = special_symbols,
+                              my_stop_word_file = stop_words_file,
+                              keep.id=TRUE,
+                              doIDF = FALSE)
+
+term2_tfidf <- tapply(desc_content_DTM_2$v/slam::row_sums(
+  desc_content_DTM_2)[desc_content_DTM_2$i], 
+                     desc_content_DTM_2$j, mean) *
+              log2(tm::nDocs(desc_content_DTM_2)/slam::col_sums(desc_content_DTM_2 > 0))
+
+summary(term2_tfidf)
+
+term2_tfidf_iqr <- summary(term2_tfidf)[5] - summary(term2_tfidf)[2]
+
+desc_content_DTM_2.reduced <- desc_content_DTM_2[,
+                                       term2_tfidf < (summary(term2_tfidf)[5] 
+                                                       + 1.5 *  term2_tfidf_iqr) &
+                           term2_tfidf >= (summary(term2_tfidf)[2] - 
+                                             1.5 * term2_tfidf_iqr)]
+
+# desc_content_DTM_2.reduced <- desc_content_DTM_2[,
+#                       term2_tfidf >= (summary(term2_tfidf)[2])]
+summary(slam::col_sums(desc_content_DTM_2.reduced))
+#desc_content_DTM_2.reduced$v <- desc_content_DTM_2.reduced$v * (2^2)
+```
+
+### Word cloud for two consequtive words
+
+```{r description wordclouds_2}
+
+wf_desc_content_DTM_2 <- wf.generate(dtm=desc_content_DTM_2.reduced,
+                                 wc_freq = 50,
+                                 wc_freq_scale = c(2.5, .25))
+
+```
+
+
+```{r description dtm_3}
+
+desc_content_DTM_3 <- dtm.generate(desc_keywordsDF,
+                              3,1,
+                              spl_sym = special_symbols,
+                              my_stop_word_file = stop_words_file,
+                              keep.id=TRUE,
+                              doIDF = FALSE)
+
+term3_tfidf <- tapply(desc_content_DTM_3$v/slam::row_sums(
+  desc_content_DTM_3)[desc_content_DTM_3$i], 
+                     desc_content_DTM_3$j, mean) *
+              log2(tm::nDocs(desc_content_DTM_3)/slam::col_sums(desc_content_DTM_3 > 0))
+
+summary(term3_tfidf)
+
+term3_tfidf_iqr <- summary(term3_tfidf)[5] - summary(term3_tfidf)[2]
+
+desc_content_DTM_3.reduced <- desc_content_DTM_3[,
+                                       term3_tfidf < (summary(term3_tfidf)[5] 
+                                                       + 1.5 *  term3_tfidf_iqr) &
+                          term3_tfidf >= (summary(term3_tfidf)[2] 
+                                          - 1.5 * term3_tfidf_iqr)]
+
+# desc_content_DTM_3.reduced <- desc_content_DTM_3[,
+#                         term3_tfidf >= (summary(term3_tfidf))[2]] 
+summary(slam::col_sums(desc_content_DTM_3.reduced))
+#desc_content_DTM_3.reduced$v <- desc_content_DTM_3.reduced$v * (3^3)
+
+```
+
+### Word cloud for three consequtive words
+
+```{r description wordclouds_3}
+
+wf_desc_content_DTM_3 <- wf.generate(dtm=desc_content_DTM_3.reduced,
+                                 wc_freq = 50,
+                                 wc_freq_scale = c(1.5, .15))
+
+```
+
+
+```{r description dtm_consolidated}
+
+desc_content_DTM <- cbind(desc_content_DTM_3.reduced,
+                         desc_content_DTM_2.reduced,
+                         desc_content_DTM_1.reduced)
+
+
+desc_content_DTM.uncl <- remove.unclustered.dtm(desc_content_DTM)
+
+```
+
+### Word cloud for terms that is used for classification
+
+```{r description wordclouds_consolidated}
+
+
+wf_desc_content_DTM.uncl <- wf.generate(dtm=desc_content_DTM.uncl,
+                                 wc_freq = 100,
+                                 wc_freq_scale = c(2, .2))
+
+```
+
+### Consolidating Subject and description DTMs
+
+```{r cons dtm subject and description}
+
+sub_content_DTM$dimnames[[2]] <- paste("sub", sub_content_DTM$dimnames[[2]], sep = "_")
+desc_content_DTM$dimnames[[2]] <- paste("desc", desc_content_DTM$dimnames[[2]], sep = "_")
+
+content_DTM <- cbind(desc_content_DTM,sub_content_DTM)
+
+content_DTM.uncl <- remove.unclustered.dtm(content_DTM)
+
+```
+
+### Prepare Data for training
+
+```{r to df for training}
+
+con_dtm_df <- as.data.frame.matrix(content_DTM.uncl)
+colnames(con_dtm_df) <- make.names(colnames(con_dtm_df))
+con_dtm_df$Case.Number <- rownames(con_dtm_df)
+con_dtm_df <- con_dtm_df %>% 
+              inner_join(training,by = "Case.Number") %>%
+              select(-one_of(text_column))
+
+```
+
+### Prepare Data for testing
+
+
+#### Subject
+
+```{r test subject data prep}
+
+sub_test_keywordsDF <- cbind.data.frame(testing$Case.Number,testing[,text_column[1]],
+                                  stringsAsFactors = FALSE)
+
+names(sub_test_keywordsDF) <- c("ID","content")
+
+sub_test_DTM_1 <- dtm.generate(sub_test_keywordsDF,
+                              1,1,
+                              spl_sym = special_symbols,
+                              my_stop_word_file = stop_words_file,
+                              keep.id=TRUE,
+                              doIDF = FALSE)
+sub_test_DTM_2 <- dtm.generate(sub_test_keywordsDF,
+                              2,1,
+                              spl_sym = special_symbols,
+                              my_stop_word_file = stop_words_file,
+                              keep.id=TRUE,
+                              doIDF = FALSE)
+
+sub_test_DTM_3 <- dtm.generate(sub_test_keywordsDF,
+                              3,1,
+                              spl_sym = special_symbols,
+                              my_stop_word_file = stop_words_file,
+                              keep.id=TRUE,
+                              doIDF = FALSE)
+
+sub_test_DTM <- cbind(sub_test_DTM_3,sub_test_DTM_2,sub_test_DTM_1)
+
+```
+
+#### Description
+
+```{r test description  data prep}
+
+desc_test_keywordsDF <- cbind.data.frame(testing$Case.Number,testing[,text_column[2]],
+                                  stringsAsFactors = FALSE)
+
+names(desc_test_keywordsDF) <- c("ID","content")
+
+desc_test_DTM_1 <- dtm.generate(desc_test_keywordsDF,
+                              1,1,
+                              spl_sym = special_symbols,
+                              my_stop_word_file = stop_words_file,
+                              keep.id=TRUE,
+                              doIDF = FALSE)
+desc_test_DTM_2 <- dtm.generate(desc_test_keywordsDF,
+                              2,1,
+                              spl_sym = special_symbols,
+                              my_stop_word_file = stop_words_file,
+                              keep.id=TRUE,
+                              doIDF = FALSE)
+
+desc_test_DTM_3 <- dtm.generate(desc_test_keywordsDF,
+                              3,1,
+                              spl_sym = special_symbols,
+                              my_stop_word_file = stop_words_file,
+                              keep.id=TRUE,
+                              doIDF = FALSE)
+
+desc_test_DTM <- cbind(desc_test_DTM_3,desc_test_DTM_2,desc_test_DTM_1)
+```
+
+### Consolidating Subject and description test DTMs
+
+```{r test cons dtm subject and description}
+
+sub_test_DTM$dimnames[[2]] <- paste("sub", sub_test_DTM$dimnames[[2]], sep = "_")
+desc_test_DTM$dimnames[[2]] <- paste("desc", desc_test_DTM$dimnames[[2]], sep = "_")
+
+test_DTM <- cbind(desc_content_DTM,sub_content_DTM)
+
+test_dtm_df <- as.data.frame.matrix(test_DTM)
+colnames(test_dtm_df) <- make.names(colnames(test_dtm_df))
+test_dtm_df$Case.Number <- rownames(test_dtm_df)
+test_dtm_df <- test_dtm_df %>% 
+              inner_join(testing,by = "Case.Number") %>%
+              select(-one_of(text_column))
+
+
+```
+
+# Model Building
+
+## Binary classification
+
+### Statistical test
+
+```{r stats test binary}
+
+stat_test_result_bi <- run_stat_test(con_dtm_df[,-which(colnames(con_dtm_df) %in%
+                                                    c("Case.Number","Category"))],
+                                     "is_fyi")
+stats_test_df_bi_sig <- stat_test_result_bi[stat_test_result_bi$p_value <= 0.05,]
+
+```
+
+### Remove insignificant columns
+
+```{r bi class }
+
+train_bi_df <- con_dtm_df %>%
+                select(one_of(c("Case.Number","is_fyi",
+                                unique(stats_test_df_bi_sig$Independent_Variable))))
+
+```
+
+
+### Remove highly co-related columns
+
+```{r high cor bi}
+
+temp_df_4_cor <- train_bi_df[,-which(colnames(train_bi_df) %in%
+                                                    c("is_fyi","Case.Number"))]
+
+cor_df = cor(temp_df_4_cor)
+hc <- findCorrelation(cor_df, exact = T, cutoff=0.99) # putt any value as a "cutoff" 
+hc <- sort(hc)
+train_bi_df_red <- cbind(is_fyi=train_bi_df$is_fyi,temp_df_4_cor[,-c(hc)])
+
+print(dim(train_bi_df_red))
+
+```
+
+### Remove near zero variances
+
+```{r remove near zero variance prdictor for binary classification}
+
+nzv <- nearZeroVar(train_bi_df_red, 
+                   freqCut = 99.9/0.1, 
+                   uniqueCut = 10,
+                   saveMetrics = TRUE)
+
+print(xtable(as.data.frame(nzv[nzv[,"nzv"] > 0, ])),
+      type="html",include.rownames = TRUE)
+
+
+
+#train_bi_df_red <- train_bi_df_red[, -nzv[,"zeroVar"]]
+
+print(dim(train_bi_df_red))
+
+```
+
+### Aligning independent variables of test with train
+
+```{r align train and test}
+
+train_same_cols <- intersect(colnames(train_bi_df_red),colnames(test_dtm_df))
+train_diff_cols <- setdiff(colnames(train_bi_df_red),colnames(test_dtm_df))
+
+test_dtm_bi_df <- test_dtm_df[,train_same_cols]
+temp_dummy <- read.table(textConnection(""), col.names = train_diff_cols,
+                 colClasses = "integer")
+
+test_dtm_bi_df <- bind_rows(test_dtm_bi_df, temp_dummy)
+
+test_dtm_bi_df[is.na(test_dtm_bi_df)] <- 0
+
+```
+
+### Creation of model weights
+
+```{r model weights is_fyi }
+is_fyi_prop <- as.data.frame(as.matrix(1/table(train_bi_df_red$is_fyi)))
+is_fyi_prop$type <- rownames(is_fyi_prop)
+is_fyi_prop <- is_fyi_prop[order(is_fyi_prop$V1),]
+
+weights <- is_fyi_prop$V1
+names(weights) <- rownames(is_fyi_prop) #[nrow(fyi_type_prop):1]
+myWeight <- rep(NA,length(train_bi_df_red$is_fyi))
+
+for(i in 1:length(weights))
+{
+  myWeight[train_bi_df_red$is_fyi == names(weights)[i]] <- weights[i] * 0.5
+
+}
+
+```
+
+###  GLM model with weighting
+
+```{r  glm is_fyi prediction}
+
+set.seed(32)
+glm_control <- trainControl(method="repeatedcv",
+                               verbose = FALSE,
+                               repeats = 3,
+                               number = 3,
+                               summaryFunction = twoClassSummary,
+                               classProbs = TRUE)
+
+# train the model
+if_glm_model <- train(is_fyi ~ .,
+                      data=train_bi_df_red,
+                      method="glm",
+                      family="binomial",
+                      metric= "ROC",
+                      tuneLength = 10,
+                      weights = myWeight,
+                      preProcess="pca",
+                      trControl=glm_control)
+
+
+print(xtable(as.data.frame(getTrainPerf(if_glm_model))),
+      type="html",include.rownames = FALSE)
+
+
+```
+
+
+#### Variable importance
+
+```{r var importance glm is_fyi prediction}
+
+importance <- varImp(if_glm_model)
+
+ImpMeasure<-data.frame(importance$importance)
+ImpMeasure$Vars<-row.names(ImpMeasure)
+top_ImpMeasure <- ImpMeasure[order(-ImpMeasure$Overall),]
+
+ggplot(top_ImpMeasure[1:10,], aes(x=reorder(Vars,Overall), y = Overall)) +
+  geom_bar(stat='identity') +
+  coord_flip()
+
+
+```
+
+
+#### Training confusion matrix
+
+```{r train confusion matrix glm is_fyi prediction}
+
+conf_mat_train <- confusionMatrix(if_glm_model)
+
+conf_mat_train_df <- as.data.frame(conf_mat_train$table)
+
+conf_mat_train_df <- dcast(conf_mat_train_df,Prediction~Reference,value.var="Freq")
+
+print(xtable(conf_mat_train_df),
+      type="html",include.rownames = FALSE)
+
+```
+
+#### ROC test
+
+```{r roc test glm model is_fyi prediction}
+
+test_roc <- function(model, data) {
+  roc(data$is_fyi,
+      predict(model, data, type = "prob")[,"no"])
+
+}
+
+if_glm_model %>%
+  test_roc(data = train_bi_df_red) %>%
+  auc()
+
+```
+
+
+#### Testing
+
+```{r test  glm is_fyi prediction}
+
+glm_pred <- predict(if_glm_model,test_dtm_bi_df)
+conf_mat_test <- confusionMatrix(glm_pred,test_dtm_bi_df$is_fyi)
+
+```
+
+#### Classwise metrics
+
+```{r glm classwise metrics is_fyi prediction}
+
+print(xtable(as.data.frame(conf_mat_test$byClass)),
+      type="html",include.rownames = TRUE)
+
+
+```
+
+
+#### Overall statistics
+
+```{r overall stat is_fyi prediction}
+
+print(xtable(as.data.frame(conf_mat_test$overall)),
+      type="html",include.rownames = TRUE)
+
+
+```
+
+#### Confusion Matrix
+
+```{r test conf is_fyi prediction}
+
+conf_mat_test_df <- as.data.frame(conf_mat_test$table)
+conf_mat_test_df <- dcast(conf_mat_test_df,Prediction~Reference,value.var="Freq")
+
+print(xtable(conf_mat_test_df),
+      type="html",include.rownames = FALSE)
+
+```
+
+
+#### ROC test
+
+```{r roc test on test data is_fyi prediction}
+
+glm_roc <-  test_roc(if_glm_model, data = test_dtm_bi_df)
+
+plot(glm_roc, print.thres = c(.5), type = "S",
+     print.thres.pattern = "%.3f (Spec = %.2f, Sens = %.2f)",
+     print.thres.cex = .8,
+     legacy.axes = TRUE)
+
+print(auc(glm_roc))
+
+```
+
+###  RF model with weighting
+
+```{r  rf is_fyi prediction}
+
+set.seed(32)
+rf_control <- trainControl(method="repeatedcv",
+                               verbose = FALSE,
+                               repeats = 3,
+                               number = 3,
+                               summaryFunction = twoClassSummary,
+                               classProbs = TRUE)
+
+# train the model
+if_rf_model <- train(is_fyi ~ .,
+                      data=train_bi_df_red,
+                      method="rf",
+                      metric= "ROC",
+                      tuneLength = 10,
+                      weights = myWeight,
+                      preProcess="pca",
+                      trControl=rf_control)
+
+
+print(xtable(as.data.frame(getTrainPerf(if_rf_model))),
+      type="html",include.rownames = FALSE)
+
+
+```
+
+
+#### Variable importance
+
+```{r var importance rf is_fyi prediction}
+
+importance <- varImp(if_rf_model)
+ImpMeasure<-data.frame(importance$importance)
+ImpMeasure$Vars<-row.names(ImpMeasure)
+top_ImpMeasure <- ImpMeasure[order(-ImpMeasure$Overall),]
+
+ggplot(top_ImpMeasure[1:10,], aes(x=reorder(Vars,Overall), y = Overall)) +
+  geom_bar(stat='identity') +
+  coord_flip()
+
+
+```
+
+
+#### Training confusion matrix
+
+```{r train confusion matrix rf is_fyi prediction}
+
+conf_mat_train <- confusionMatrix(if_rf_model)
+conf_mat_train_df <- as.data.frame(conf_mat_train$table)
+
+conf_mat_train_df <- dcast(conf_mat_train_df,Prediction~Reference,value.var="Freq")
+
+print(xtable(conf_mat_train_df),
+      type="html",include.rownames = FALSE)
+
+```
+
+#### ROC test
+
+```{r roc test rf model is_fyi prediction}
+
+test_roc <- function(model, data) {
+  roc(data$is_fyi,
+      predict(model, data, type = "prob")[,"no"])
+
+}
+
+if_rf_model %>%
+  test_roc(data = train_bi_df_red) %>%
+  auc()
+
+
+```
+
+#### Testing
+
+```{r test  rf is_fyi prediction}
+
+rf_pred <- predict(if_rf_model,test_dtm_bi_df)
+conf_mat_test <- confusionMatrix(rf_pred,test_dtm_bi_df$is_fyi)
+
+
+```
+
+#### Classwise metrics
+
+```{r rf classwise metrics is_fyi prediction}
+
+print(xtable(as.data.frame(conf_mat_test$byClass)),
+      type="html",include.rownames = TRUE)
+
+
+```
+
+
+#### Overall statistics
+
+```{r rf overall stat is_fyi prediction}
+
+
+print(xtable(as.data.frame(conf_mat_test$overall)),
+      type="html",include.rownames = TRUE)
+
+
+```
+
+#### Confusion Matrix
+
+```{r rf test conf is_fyi prediction}
+
+conf_mat_test_df <- as.data.frame(conf_mat_test$table)
+conf_mat_test_df <- dcast(conf_mat_test_df,Prediction~Reference,value.var="Freq")
+print(xtable(conf_mat_test_df),
+      type="html",include.rownames = FALSE)
+
+```
+
+
+#### ROC test
+
+```{r rf roc test on test data is_fyi prediction}
+
+rf_roc <-  test_roc(if_rf_model, data = test_dtm_bi_df)
+
+plot(rf_roc, print.thres = c(.5), type = "S",
+     print.thres.pattern = "%.3f (Spec = %.2f, Sens = %.2f)",
+     print.thres.cex = .8,
+     legacy.axes = TRUE)
+
+print(auc(rf_roc))
+
+
+```
+
+### RF with adjusted class probabilities
+
+#### Fit new customised RF model to adjust class probability
+
+```{r rf adj prob is_fyi}
+
+thresh_code <- getModelInfo("rf", regex = FALSE)[[1]]
+# rf model modified with following parameters
+#         thresh_code$type
+#         thresh_code$parameters
+#         thresh_code$grid
+#         thresh_code$loop
+#         thresh_code$fit
+#         thresh_code$predict
+#         thresh_code$prob
+
+                thresh_code$type <- c("Classification") #...1
+                ## Add the threshold as another tuning parameter
+                thresh_code$parameters <- data.frame(
+                  parameter = c("mtry", "threshold"),  #...2
+                  class = c("numeric", "numeric"),
+                  label = c("#Randomly Selected Predictors","Probability Cutoff"))
+                ## The default tuning grid code:
+                thresh_code$grid <- function(x, y, len = NULL, search = "grid") {  #...3
+                    p <- ncol(x)
+                    if(search == "grid") {
+                        grid <- expand.grid(mtry = floor(sqrt(p)),
+                                            threshold = seq(.01, .99, length = len))
+                    } else {
+                        grid <- expand.grid(mtry = sample(1:p, size = len),
+                                            threshold = runif(1, 0, size = len))
+                    }
+                    grid
+                }
+
+                ## Here we fit a single random forest model (with a fixed mtry)
+                ## and loop over the threshold values to get predictions from the same
+                ## randomForest model.
+                thresh_code$loop = function(grid) {    #...4
+                    library(plyr)
+                    loop <- ddply(grid, c("mtry"),
+                                  function(x) c(threshold = max(x$threshold)))
+                    submodels <- vector(mode = "list", length = nrow(loop))
+                    for(i in seq(along = loop$threshold)) {
+                        index <- which(grid$mtry == loop$mtry[i])
+                        cuts <- grid[index, "threshold"]
+                        submodels[[i]] <- data.frame(
+                          threshold = cuts[cuts != loop$threshold[i]])
+                    }
+                    list(loop = loop, submodels = submodels)
+                }
+
+                ## Fit the model independent of the threshold parameter
+                thresh_code$fit = function(x, y, wts, param, lev, last, classProbs, ...)
+                  {  #...5
+                    if(length(levels(y)) != 2)
+                        stop("This works only for 2-class problems")
+                    randomForest(x, y, mtry = param$mtry, ...)
+                }
+
+                ## Now get a probability prediction and use different thresholds to
+                ## get the predicted class
+                thresh_code$predict = function(modelFit, newdata, submodels = NULL)
+                  {    #...6
+                    class1Prob <- predict(modelFit,
+                                          newdata,
+                                          type = "prob")[, modelFit$obsLevels[1]]
+                    ## Raise the threshold for class #1 and a higher level of
+                    ## evidence is needed to call it class 1 so it should
+                    ## decrease sensitivity and increase specificity
+                    out <- ifelse(class1Prob >= modelFit$tuneValue$threshold,
+                                  modelFit$obsLevels[1],
+                                  modelFit$obsLevels[2])
+                    if(!is.null(submodels)) {
+                        tmp2 <- out
+                        out <- vector(mode = "list", length = length(submodels$threshold))
+                        out[[1]] <- tmp2
+                        for(i in seq(along = submodels$threshold)) {
+                            out[[i+1]] <- ifelse(class1Prob >= submodels$threshold[[i]],
+                                                 modelFit$obsLevels[1],
+                                                 modelFit$obsLevels[2])
+                        }
+                    }
+                    out
+                }
+                ## The probabilities are always the same but we have to create
+                ## mulitple versions of the probs to evaluate the data across
+                ## thresholds
+                thresh_code$prob = function(modelFit, newdata, submodels = NULL)
+                  {   #...7
+                    out <- as.data.frame(predict(modelFit, newdata, type = "prob"))
+                    if(!is.null(submodels)) {
+                        probs <- out
+                        out <- vector(mode = "list",
+                                      length = length(submodels$threshold)+1)
+                        out <- lapply(out, function(x) probs)
+                    }
+                    out
+                }
+
+                ### for summaryFunction in trControl
+                fourStats <- function (data, lev = levels(data$obs), model = NULL) {
+                    ## This code will get use the area under the ROC curve and the
+                    ## sensitivity and specificity values using the current candidate
+                    ## value of the probability threshold.
+                    out <- c(twoClassSummary(data, lev = levels(data$obs), model = NULL))
+
+                    ## The best possible model has sensitivity of 1 and specificity of 1.
+                    ## How far are we from that value?
+                    coords <- matrix(c(1, 1, out["Spec"], out["Sens"]),
+                                     ncol = 2,
+                                     byrow = TRUE)
+                    colnames(coords) <- c("Spec", "Sens")
+                    rownames(coords) <- c("Best", "Current")
+                    c(out, Dist = dist(coords)[1])
+                }
+################## Modeling with customized RF model ###################
+#>>>>>>>>>>>>>>>
+set.seed(949)
+mod1 <- train(is_fyi ~ .,
+              data=train_bi_df_red,
+              method = thresh_code,  # modified model -- in lieu of "rf"
+              ## Minimize the distance to the perfect model
+              metric = "Dist",
+              maximize = FALSE,
+              tuneLength = 20,   #  20,
+              ntree = 200,          # 1000,
+              trControl = trainControl(method = "repeatedcv",
+                                       repeats = 3,
+                                       number = 5,
+                                       classProbs = TRUE,
+                                       summaryFunction = fourStats))
+
+mod1
+
+metrics <- mod1$results[, c(2, 4:6)]
+metrics <- melt(metrics, id.vars = "threshold",
+                variable.name = "Resampled",
+                value.name = "Data")
+
+ggplot(metrics, aes(x = threshold, y = Data, color = Resampled)) +
+    geom_line() +
+    ylab("") + xlab("Probability Cutoff") +
+    theme(legend.position = "top")
+
+```
+
+#### Testing
+
+```{r test adjusted rf is_fyi prediction}
+
+rf_adjt_pred <- predict(mod1,test_dtm_bi_df)
+conf_mat_test <- confusionMatrix(rf_adjt_pred,test_dtm_bi_df$is_fyi)
+
+
+```
+
+#### Classwise metrics
+
+```{r rf adjusted classwise metrics is_fyi prediction}
+
+print(xtable(as.data.frame(conf_mat_test$byClass)),
+      type="html",include.rownames = TRUE)
+
+
+```
+
+
+#### Overall statistics
+
+```{r rf adjusted overall stat is_fyi prediction}
+
+print(xtable(as.data.frame(conf_mat_test$overall)),
+      type="html",include.rownames = TRUE)
+
+```
+
+#### Confusion Matrix
+
+```{r rf adjusted test conf is_fyi prediction}
+
+conf_mat_test_df <- as.data.frame(conf_mat_test$table)
+
+conf_mat_test_df <- dcast(conf_mat_test_df,Prediction~Reference,value.var="Freq")
+print(xtable(conf_mat_test_df),
+      type="html",include.rownames = FALSE)
+
+
+```
+
+
+#### ROC test
+
+```{r rf adjusted roc test on test data is_fyi prediction}
+
+rf_adjt_roc <-  test_roc(mod1, data = test_dtm_bi_df)
+plot(rf_adjt_roc, print.thres = c(0.8352632), type = "S",
+     print.thres.pattern = "%.3f (Spec = %.2f, Sens = %.2f)",
+     print.thres.cex = .8,
+     legacy.axes = TRUE)
+
+print(auc(rf_adjt_roc))
+
+```
+
+
+###  GBM model with weighting
+
+```{r  gbm is_fyi prediction}
+
+set.seed(32)
+gbm_control <- trainControl(method="repeatedcv",
+                               verbose = FALSE,
+                               repeats = 3,
+                               number = 3,
+                               summaryFunction = twoClassSummary,
+                               classProbs = TRUE)
+
+# train the model
+if_gbm_model <- train(is_fyi ~ .,
+                      data=train_bi_df_red,
+                      method="gbm",
+                      metric= "ROC",
+                      tuneLength = 10,
+                      weights = myWeight,
+                      preProcess="pca",
+                      trControl=gbm_control)
+
+
+print(xtable(as.data.frame(getTrainPerf(if_gbm_model))),
+      type="html",include.rownames = FALSE)
+
+
+```
+
+
+#### Variable importance
+
+```{r var importance gbm is_fyi prediction}
+
+importance <- varImp(if_gbm_model)
+
+ImpMeasure<-data.frame(importance$importance)
+ImpMeasure$Vars<-row.names(ImpMeasure)
+top_ImpMeasure <- ImpMeasure[order(-ImpMeasure$Overall),]
+
+ggplot(top_ImpMeasure[1:10,], aes(x=reorder(Vars,Overall), y = Overall)) +
+  geom_bar(stat='identity') +
+  coord_flip()
+
+```
+
+
+#### Training confusion matrix
+
+```{r train confusion matrix gbm is_fyi prediction}
+
+conf_mat_train <- confusionMatrix(if_gbm_model)
+conf_mat_train_df <- as.data.frame(conf_mat_train$table)
+
+conf_mat_train_df <- dcast(conf_mat_train_df,Prediction~Reference,value.var="Freq")
+
+print(xtable(conf_mat_train_df),
+      type="html",include.rownames = FALSE)
+
+```
+
+#### ROC test
+
+```{r roc test gbm model is_fyi prediction}
+
+test_roc <- function(model, data) {
+  roc(data$is_fyi,
+      predict(model, data, type = "prob")[,"no"])
+
+}
+
+if_gbm_model %>%
+  test_roc(data = train_bi_df_red) %>%
+  auc()
+
+
+```
+
+#### Testing
+
+```{r test  gbm is_fyi prediction}
+
+gbm_pred <- predict(if_gbm_model,test_dtm_bi_df)
+conf_mat_test <- confusionMatrix(gbm_pred,test_dtm_bi_df$is_fyi)
+
+
+```
+
+#### Overall statistics
+
+```{r gbm overall stat is_fyi prediction}
+
+print(xtable(as.data.frame(conf_mat_test$overall)),
+      type="html",include.rownames = TRUE)
+
+```
+
+#### Classwise metrics
+
+```{r gbm classwise metrics is_fyi prediction}
+
+print(xtable(as.data.frame(conf_mat_test$byClass)),
+      type="html",include.rownames = TRUE)
+
+
+```
+
+
+#### Confusion Matrix
+
+```{r gbm test conf is_fyi prediction}
+
+conf_mat_test_df <- as.data.frame(conf_mat_test$table)
+conf_mat_test_df <- dcast(conf_mat_test_df,Prediction~Reference,value.var="Freq")
+
+print(xtable(conf_mat_test_df),
+      type="html",include.rownames = FALSE)
+
+
+```
+
+
+#### ROC test
+
+```{r gbm roc test on test data is_fyi prediction}
+
+gbm_roc <-  test_roc(if_gbm_model, data = test_dtm_bi_df)
+
+plot(gbm_roc, print.thres = c(.5), type = "S",
+     print.thres.pattern = "%.3f (Spec = %.2f, Sens = %.2f)",
+     print.thres.cex = .8,
+     legacy.axes = TRUE)
+
+print(auc(gbm_roc))
+
+
+```
+
+###  NB model with weighting
+
+```{r  nb is_fyi prediction}
+
+set.seed(32)
+nb_control <- trainControl(method="repeatedcv",
+                               verbose = FALSE,
+                               repeats = 3,
+                               number = 3,
+                               summaryFunction = twoClassSummary,
+                               classProbs = TRUE)
+
+# train the model
+if_nb_model <- train(is_fyi ~ .,
+                      data=train_bi_df_red,
+                      method="nb",
+                      metric= "ROC",
+          						tuneLength = 10,
+          						preProcess="pca",
+                      weights = myWeight,
+                      trControl=nb_control)
+
+
+print(xtable(as.data.frame(getTrainPerf(if_nb_model))),
+      type="html",include.rownames = FALSE)
+
+
+```
+
+
+#### Training confusion matrix
+
+```{r train confusion matrix nb is_fyi prediction}
+
+conf_mat_train <- confusionMatrix(if_nb_model)
+conf_mat_train_df <- as.data.frame(conf_mat_train$table)
+
+conf_mat_train_df <- dcast(conf_mat_train_df,Prediction~Reference,value.var="Freq")
+
+print(xtable(conf_mat_train_df),
+      type="html",include.rownames = FALSE)
+
+```
+
+#### ROC test
+
+```{r roc test nb model is_fyi prediction}
+
+test_roc <- function(model, data) {
+  roc(data$is_fyi,
+      predict(model, data, type = "prob")[,"no"])
+
+}
+
+if_nb_model %>%
+  test_roc(data = train_bi_df_red) %>%
+  auc()
+
+
+```
+
+#### Testing
+
+```{r test  nb is_fyi prediction}
+
+nb_pred <- predict(if_nb_model,test_dtm_bi_df)
+conf_mat_test <- confusionMatrix(nb_pred,test_dtm_bi_df$is_fyi)
+
+
+```
+
+#### Overall statistics
+
+```{r nb overall stat is_fyi prediction}
+
+
+print(xtable(as.data.frame(conf_mat_test$overall)),
+      type="html",include.rownames = TRUE)
+
+
+```
+
+
+#### Classwise metrics
+
+```{r nb classwise metrics is_fyi prediction}
+
+print(xtable(as.data.frame(conf_mat_test$byClass)),
+      type="html",include.rownames = TRUE)
+
+
+```
+
+#### Confusion Matrix
+
+```{r nb test conf is_fyi prediction}
+
+conf_mat_test_df <- as.data.frame(conf_mat_test$table)
+conf_mat_test_df <- dcast(conf_mat_test_df,Prediction~Reference,value.var="Freq")
+print(xtable(conf_mat_test_df),
+      type="html",include.rownames = FALSE)
+
+```
+
+
+#### ROC test
+
+```{r nb roc test on test data is_fyi prediction}
+
+nb_roc <-  test_roc(if_nb_model, data = test_dtm_bi_df)
+
+plot(nb_roc, print.thres = c(.5), type = "S",
+     print.thres.pattern = "%.3f (Spec = %.2f, Sens = %.2f)",
+     print.thres.cex = .8,
+     legacy.axes = TRUE)
+
+print(auc(nb_roc))
+
+```
+
+# Model stacking
+
+## Prepare data for modelling
+
+```{r pred model stacking data}
+
+if_train_rf_pred <- predict(if_rf_model, train_bi_df_red, type = "prob")
+if_train_gbm_pred <- predict(if_gbm_model, train_bi_df_red, type = "prob")
+
+predicted_train <- cbind(if_train_rf_pred,if_train_gbm_pred,
+                         if_fyi=train_bi_df_red$is_fyi)
+
+colnames(predicted_train) <- c("rf_no","rf_yes","gbm_no","gbm_yes","is_fyi")
+
+print(xtable(strtable(predicted_train)),
+      type="html",include.rownames = FALSE)
+
+if_test_rf_pred <- predict(if_rf_model, test_dtm_bi_df, type = "prob")
+if_test_gbm_pred <- predict(if_gbm_model, test_dtm_bi_df, type = "prob")
+
+
+predicted_test <- cbind(if_test_rf_pred,if_test_gbm_pred,
+                         if_fyi=test_dtm_bi_df$is_fyi)
+colnames(predicted_test) <- c("rf_no","rf_yes","gbm_no","gbm_yes","is_fyi")
+
+```
+
+
+## Model creation
+
+### Random Forest
+
+```{r rf model stacking is_fyi prediction}
+
+# train the model
+ms_rf_model <- train(is_fyi~.,
+                      data=predicted_train,
+                      method="rf",
+                      metric= "ROC",
+					            tuneLength = 10,
+                      weights = myWeight,
+                      trControl=rf_control)
+
+print(xtable(as.data.frame(getTrainPerf(ms_rf_model))),
+      type="html",include.rownames = FALSE)
+
+```
+
+#### Variable importance
+
+```{r rf var importance model stacking is_fyi prediction}
+
+# estimate variable importance
+importance <- varImp(ms_rf_model, scale=FALSE)
+# summarize importance
+#print(importance[1:10,])
+# plot importance
+#plot(importance)
+
+ImpMeasure<-data.frame(importance$importance)
+ImpMeasure$Vars<-row.names(ImpMeasure)
+top_ImpMeasure <- ImpMeasure[order(-ImpMeasure$Overall),]
+
+ggplot(top_ImpMeasure[1:10,], aes(x=reorder(Vars,Overall), y = Overall)) +
+  geom_bar(stat='identity') +
+  coord_flip()
+
+
+```
+
+#### Training confusion matrix
+
+```{r train rf confusion matrix is_fyi model stacking prediction}
+
+conf_mat_train <- confusionMatrix(ms_rf_model)
+
+conf_mat_train_df <- as.data.frame(conf_mat_train$table)
+
+conf_mat_train_df <- dcast(conf_mat_train_df,Prediction~Reference,value.var="Freq")
+
+print(xtable(conf_mat_train_df),
+      type="html",include.rownames = FALSE)
+
+```
+
+
+### Testing model stacking
+
+```{r test ms is_fyi prediction}
+
+ms_rf_pred <- predict(ms_rf_model,predicted_test)
+
+conf_mat_test <- confusionMatrix(ms_rf_pred,predicted_test$is_fyi)
+
+```
+
+#### Overall statistics
+
+```{r overall stat is_fyi prediction for ms rf}
+
+print(xtable(as.data.frame(conf_mat_test$overall)),
+      type="html",include.rownames = TRUE)
+
+
+```
+
+#### Classwise metrics
+
+```{r classwise metrics is_fyi prediction for ms rf}
+
+print(xtable(as.data.frame(conf_mat_test$byClass)),
+      type="html",include.rownames = TRUE)
+
+
+```
+
+#### Confusion Matrix
+
+```{r test conf is_fyi prediction for ms rf}
+
+conf_mat_test_df <- as.data.frame(conf_mat_test$table)
+
+conf_mat_test_df <- dcast(conf_mat_test_df,Prediction~Reference,value.var="Freq")
+
+print(xtable(conf_mat_test_df),
+      type="html",include.rownames = FALSE)
+
+
+```
+
